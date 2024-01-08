@@ -1,0 +1,16 @@
+# Makefile Project-Specific Variables
+
+# User shell
+SHELL := bash
+
+# Specify environment type: `conda` or `venv`
+ENV_TYPE ?= conda
+
+# Specify path to virtual environment to use for this project, if used
+VENV_PATH :=
+
+# Specify Conda env name, if used
+CONDA_ENV_NAME := ML
+
+# Source directory root
+SOURCE_DIR = src/custom_gpt2

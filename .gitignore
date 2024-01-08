@@ -1,0 +1,4 @@
+.tox
+build
+src/Andrei.egg-info
+.idea
