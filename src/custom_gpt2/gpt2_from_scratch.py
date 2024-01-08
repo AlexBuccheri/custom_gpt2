@@ -61,3 +61,5 @@ if __name__ == "__main__":
     #     print(x[:i+1], y[i])
 
     # x, y = get_batch(training_data, block_size, batch_size)
+
+    # At 22.44
