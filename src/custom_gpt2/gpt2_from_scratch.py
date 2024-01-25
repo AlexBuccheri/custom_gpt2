@@ -6,80 +6,57 @@ TODOs
 * Check out [SentencePiece](https://github.com/google/sentencepiece by Google, and
   [tiktoken](https://github.com/openai/tiktoken) by openAI
 """
+import dataclasses
 from pathlib import Path
 
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-
-from encoders import char_encoder, char_decoder
-from requests_func import request_data
 from batch import get_batch
+from bigram import BigramLanguageModel
+from cuda_settings import device
+from encoders import char_decoder, char_encoder
+from requests_func import request_data
+
+# Pin seed to get results consistent with the tutorial
+torch.manual_seed(1337)
 
 
-class BigramLanguageModel(nn.Module):
-    """ Pytorch-specific
-    Any instance of a class derived from nn.Module can be called as a function,
-    automatically invoking the forward method of the class.
+@dataclasses.dataclass
+class HyperParameters:
+    # Number of independent sequences processed in parallel
+    batch_size: int = 32
+    # Max number of characters to consider for learning == max context length
+    block_size: int = 8
+    # Number of learning iterations
+    max_iters: int = 3000
+    # Learning rate
+    # Can get away with learning rates of > 1.e-4 for small models i.e. e-3 to e-2
+    learning_rate: int = 1.0e-2
+    # Add comment
+    eval_interval: int = 300
+    # Add comment
+    eval_iters: int = 200
+
+
+# no Grad avoids calling backwards on everything in the function => more efficient memory use
+@torch.no_grad()
+def estimate_loss(training_data, validation_data, params: HyperParameters, model) -> dict:
     """
 
-    def __init__(self, vocab_size: int, *args, **kwargs):
-        """
-
-        :param vocab_size: Size of the code book
-        """
-        super().__init__(*args, **kwargs)
-        # Light wrapper around a tensor, initialised with shape(vocab_size, vocab_size)
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
-
-    def forward(self, indices, targets):
-        """ Forward pass on the model
-        Both arguments are (batch, time) tensors of shape
-        batch_size (or number of batches) and block_size
-
-        :param indices:
-        :param targets:
-        :return:
-        """
-        # Given index picks out the the ith row of the embedding table
-        # He really does not explain how this then has dimension (B, T, C)
-        # I think what it means is, given a index in a batch, give a prediction for how
-        # likely each of the characters from the code book is likely to follow. Hence the dimension
-        # So likelihood of character with integer 15 following character defined in the ith element of logits, for the
-        # ib th batch ,is logits[ib, i, 14]
-        logits = self.token_embedding_table(indices)
-
-        # cross_entropy wants channels as the final dimension (at least when k=1), so reshape by collapsing
-        # batch and time dimensions. Note, view won't reallocate memory : ) assuming type does not change
-        B, T, C = logits.shape
-        logits = logits.view(B * T, C)
-        # Have the probability of predicting the next character, and the next character (the target)
-        # so can define the loss function
-        targets = targets.view(B * T)
-        loss = F.cross_entropy(logits, targets)
-
-        return logits, loss
-
-
-    def generate(self, indices: torch.tensor, max_new_tokens: int):
-        """
-        For all batches, extend the time tokens by one per iteration,
-        for max_new_tokens iterations
-        :param max_new_tokens:
-        :return:
-        """
-        for _ in range(max_new_tokens):
-            # Get predictions
-            # No reshaping, as want to access a single T (could try this with indexing)
-            logits = self.token_embedding_table(indices)
-            # take last time step
-            logits = logits[:, -1, :]
-            # Get probabilities, applying to all channels of a given batch
-            probs = F.softmax(logits, dim=-1) # Still (B, C)
-            # Sample from distribution of probabilities
-            next_indices = torch.multinomial(probs, num_samples=1) # (B, 1)
-            indices = torch.cat((indices, next_indices), dim=1) # (B, T+1)
-        return indices
+    :return:
+    """
+    estimates = {}
+    # Switch the model into evaluation model
+    model.eval()
+    for label, data in [('train', training_data), ('val', validation_data)]:
+        losses = torch.zeros(params.eval_interval)
+        for i in range(params.eval_interval):
+            x, y = get_batch(data, params.block_size, params.batch_size)
+            _, loss = model(x, y)
+            losses[i] = loss.item()
+        estimates[label] = losses.mean()
+    # Switch back to training mode
+    model.train()
+    return estimates
 
 
 
@@ -113,40 +90,45 @@ if __name__ == "__main__":
     # Could also do len(data) to get total size
     assert list(data.shape) == [1115394]
 
+    # Split data into training and validation
     n_training = int(0.9 * len(data))
     training_data = data[:n_training]
     validation_data = data[n_training:]
 
-    # Training for LLMs needs block_size + 1, as we're training to make predictions on the block_size,
-    # but a prediction requires the ith + 1 character
-    block_size = 8
-    batch_size = 32
+    # Hyperparameter defaults
+    params = HyperParameters()
 
     # Initialise the model
     model = BigramLanguageModel(vocab_size)
+    m = model.to(device)
 
-    # Can get away with learning rates of > 1.e-4 for small models
     # Takes the gradients and updates the parameters based on these
-    optimiser = torch.optim.AdamW(model.parameters(), lr=1.e-3)
+    optimiser = torch.optim.AdamW(model.parameters(), lr=params.learning_rate)
 
-    for step in range(10000):
+    # Training loop
+    for step in range(params.max_iters):
+
+        # Evaluate the loss at set intervals
+        if step % params.eval_interval == 0:
+            losses = estimate_loss(training_data, validation_data, params, model)
+            print(f"Step {step}: Training loss {losses['train']:.4f}. Validation loss {losses['val']:.4f}")
+
         # Sample a batch of data
-        xb, yb = get_batch(training_data, block_size, batch_size)
+        xb, yb = get_batch(training_data, params.block_size, params.batch_size)
+
         # Evaluate the loss
         logits, loss = model(xb, yb)
-        # Why does one do this?
+        # What does one do this?
         optimiser.zero_grad(set_to_none=True)
         # Gets gradients for all the parameters
         loss.backward()
         # Use gradients to update parameters
         optimiser.step()
 
-    print(loss.item())
+    # print(loss.item())
 
     # Define a starting point in the text to predict following characters
     # This is the newline character
-    first_integer = torch.zeros((1, 1), dtype=torch.long)
-    prediction = model.generate(first_integer, max_new_tokens=300)[0].tolist()
+    first_integer = torch.zeros((1, 1), dtype=torch.long, device=device)
+    prediction = model.generate(first_integer, max_new_tokens=400)[0].tolist()
     print(char_decoder(prediction, chars))
-
-    # At time 37:48
